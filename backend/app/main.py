@@ -19,7 +19,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    logging.getLogger("app").info("AI Voice Agent API %s starting (llm=%s, tts=%s, turso=%s)", __version__, settings.has_any_llm_key, settings.has_elevenlabs, settings.has_turso)
+    logging.getLogger("app").info(
+        "AI Voice Agent API %s starting (llm=%s, tts=%s, turso=%s)",
+        __version__,
+        settings.has_any_llm_key,
+        settings.has_elevenlabs,
+        settings.has_turso,
+    )
     yield
 
 

@@ -47,16 +47,12 @@ def resolve_provider(preferred: str | None = None) -> str:
         if preferred not in ("openai", "anthropic", "google"):
             raise ValueError(f"Unknown provider: {preferred}")
         if not available_providers()[preferred]:
-            raise AiNotConfiguredError(
-                f"Provider '{preferred}' requested but its API key is not configured."
-            )
+            raise AiNotConfiguredError(f"Provider '{preferred}' requested but its API key is not configured.")
         return preferred
     for name, ok in available_providers().items():
         if ok:
             return name
-    raise AiNotConfiguredError(
-        "No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY."
-    )
+    raise AiNotConfiguredError("No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY.")
 
 
 DEFAULT_MODELS = {
@@ -120,7 +116,9 @@ async def _chat_openai(messages: list[ChatMessage], tools: list[dict[str, Any]] 
     )
 
 
-async def _stream_openai(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+async def _stream_openai(
+    messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None
+) -> AsyncIterator[str]:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -156,7 +154,9 @@ async def _chat_anthropic(messages: list[ChatMessage], tools: list[dict[str, Any
     return LLMResult(text=text, provider="anthropic", model=resp.model, raw=resp)
 
 
-async def _stream_anthropic(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+async def _stream_anthropic(
+    messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None
+) -> AsyncIterator[str]:
     import anthropic
 
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -182,24 +182,22 @@ async def _chat_google(messages: list[ChatMessage], tools: list[dict[str, Any]] 
 
     client = genai.Client(api_key=settings.google_api_key)
     contents = [
-        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)])
-        for m in messages
+        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)]) for m in messages
     ]
     config = types.GenerateContentConfig(system_instruction=system, tools=tools or None)
-    resp = await client.aio.models.generate_content(
-        model=DEFAULT_MODELS["google"], contents=contents, config=config
-    )
+    resp = await client.aio.models.generate_content(model=DEFAULT_MODELS["google"], contents=contents, config=config)
     return LLMResult(text=resp.text or "", provider="google", model=DEFAULT_MODELS["google"], raw=resp)
 
 
-async def _stream_google(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+async def _stream_google(
+    messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None
+) -> AsyncIterator[str]:
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=settings.google_api_key)
     contents = [
-        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)])
-        for m in messages
+        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)]) for m in messages
     ]
     config = types.GenerateContentConfig(system_instruction=system, tools=tools or None)
     async for chunk in client.aio.models.generate_content_stream(
