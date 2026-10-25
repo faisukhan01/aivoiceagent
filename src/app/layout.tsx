@@ -1,7 +1,11 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { getServerSession } from "next-auth";
+
 import "./globals.css";
-import { Toaster } from "@/components/ui/toaster";
+import "katex/dist/katex.min.css";
+import { Providers } from "@/components/app/providers";
+import { authOptions } from "@/lib/auth";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -14,27 +18,37 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AI Voice Agent — Environment Ready",
+  title: "Auralis — the AI assistant that listens",
   description:
-    "Polyglot AI Voice Agent monorepo: Next.js + Angular frontends, FastAPI voice backend, LiveKit/ElevenLabs voice AI, Turso, and multi-provider LLMs.",
-  keywords: ["AI Voice Agent", "LiveKit", "ElevenLabs", "FastAPI", "Next.js", "Angular", "Turso"],
+    "Auralis is a general-purpose AI assistant for text and natural voice conversations: streaming answers, web research, document Q&A, and real spoken dialogue.",
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
 };
 
-export default function RootLayout({
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#fafaf9" },
+    { media: "(prefers-color-scheme: dark)", color: "#0c0a09" },
+  ],
+};
+
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const session = await getServerSession(authOptions).catch(() => null);
+
   return (
     <html lang="en" suppressHydrationWarning>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
-        {children}
-        <Toaster />
+        <Providers session={session}>{children}</Providers>
       </body>
     </html>
   );

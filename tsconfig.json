@@ -42,6 +42,7 @@
     "backend",
     "mini-services",
     "examples",
-    "skills"
+    "skills",
+    "tool-results"
   ]
 }

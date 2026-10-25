@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api.routes import chat, documents, health, voice
+from app.api.routes import chat, documents, fulltext, health, voice
 from app.api.ws import router as ws_router
 from app.core.config import settings
 
@@ -42,6 +42,7 @@ app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(voice.router)
 app.include_router(documents.router)
+app.include_router(fulltext.router)
 app.include_router(ws_router)
 
 
