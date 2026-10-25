@@ -1,0 +1,16 @@
+[project]
+name = "ai-voice-agent-api"
+version = "0.1.0"
+description = "FastAPI backend for the AI Voice Agent (LLM, STT/TTS, VAD, RAG, Turso)"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

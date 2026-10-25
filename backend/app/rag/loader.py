@@ -1,152 +1,58 @@
-"""Document text extraction and chunking.
+"""Document text extraction + chunking for the RAG pipeline.
 
-Supported formats:
-* PDF       — ``pypdf`` (lazy import)
-* DOCX      — ``python-docx`` (lazy import)
-* TXT/MD/CSV/JSON-ish — UTF-8 decode (with latin-1 fallback)
-* HTML/XHTML— ``beautifulsoup4`` (lazy import)
-
-Heavy SDKs are imported lazily inside functions so the module imports
-cleanly even if an optional dependency is missing (a ``ValueError`` with a
-helpful message is raised per-file at extraction time instead).
+Supported: PDF (pypdf), DOCX (python-docx), plain text / markdown / CSV,
+HTML (BeautifulSoup4).
 """
 
 from __future__ import annotations
 
-import logging
-from pathlib import PurePosixPath
+import io
 
-logger = logging.getLogger(__name__)
-
-DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_CHUNK_OVERLAP = 150
+from app.rag.retriever import chunk_text
 
 
-def _extension(filename: str) -> str:
-    """Lowercased file extension without the dot."""
-    return PurePosixPath(filename.replace("\\", "/")).suffix.lstrip(".").lower()
+class UnsupportedDocumentError(ValueError):
+    pass
 
 
 def extract_text(filename: str, data: bytes) -> str:
-    """Extract plain text from a document's bytes based on its filename.
-
-    Args:
-        filename: Original filename (extension selects the parser).
-        data: Raw file bytes.
-
-    Returns:
-        Extracted plain text (may be empty for exotic documents).
-
-    Raises:
-        ValueError: For unsupported extensions or parse failures.
-    """
-    ext = _extension(filename)
-    logger.info("Extracting text from %s (ext=%s, %d bytes)", filename, ext or "?", len(data))
+    """Extract plain text from raw document bytes based on file extension."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
     if ext == "pdf":
         return _extract_pdf(data)
     if ext == "docx":
         return _extract_docx(data)
-    if ext == "doc":
-        raise ValueError("Legacy .doc not supported — save as .docx or .pdf")
-    if ext in {"html", "htm", "xhtml"}:
+    if ext in {"html", "htm"}:
         return _extract_html(data)
-    if ext in {"txt", "md", "markdown", "csv", "tsv", "json", "log"} or not ext:
-        return _decode_utf8(data)
-    # Best effort: try plain UTF-8 decode for unknown types.
-    logger.warning("Unknown extension %r — attempting plain-text decode", ext)
-    return _decode_utf8(data)
+    if ext in {"txt", "md", "csv", "json", ""}:
+        return data.decode("utf-8", errors="replace")
+    raise UnsupportedDocumentError(f"Unsupported document type: .{ext}")
 
 
-def _decode_utf8(data: bytes) -> str:
-    """Decode bytes as UTF-8, falling back to latin-1 for legacy files."""
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="replace")
+def extract_and_chunk(filename: str, data: bytes, chunk_size: int = 1000, overlap: int = 150) -> list[str]:
+    """Extract text and return overlapping chunks ready for embedding."""
+    return chunk_text(extract_text(filename, data), size=chunk_size, overlap=overlap)
 
 
 def _extract_pdf(data: bytes) -> str:
-    try:
-        import io
-
-        from pypdf import PdfReader
-    except ImportError as exc:  # pragma: no cover
-        raise ValueError("pypdf is required for PDF extraction") from exc
+    from pypdf import PdfReader  # lazy import
 
     reader = PdfReader(io.BytesIO(data))
-    pages: list[str] = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:  # noqa: BLE001 — single corrupt page must not kill extraction
-            pages.append("")
-    return "\n\n".join(p.strip() for p in pages if p and p.strip())
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
 
 def _extract_docx(data: bytes) -> str:
-    try:
-        import io
+    import io
 
-        import docx
-    except ImportError as exc:  # pragma: no cover
-        raise ValueError("python-docx is required for DOCX extraction") from exc
+    import docx  # lazy import
 
     document = docx.Document(io.BytesIO(data))
-    parts = [p.text for p in document.paragraphs if p.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
-            line = " | ".join(c for c in cells if c)
-            if line:
-                parts.append(line)
-    return "\n".join(parts)
+    return "\n\n".join(p.text for p in document.paragraphs if p.text.strip())
 
 
 def _extract_html(data: bytes) -> str:
-    try:
-        from bs4 import BeautifulSoup  # lazy import
-    except ImportError as exc:  # pragma: no cover
-        raise ValueError("beautifulsoup4 is required for HTML extraction") from exc
+    from bs4 import BeautifulSoup  # lazy import
 
-    soup = BeautifulSoup(_decode_utf8(data), "html.parser")
-    for tag in soup(["script", "style", "noscript", "template"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n")
-    lines = [line.strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def chunk_text(
-    text: str,
-    size: int = DEFAULT_CHUNK_SIZE,
-    overlap: int = DEFAULT_CHUNK_OVERLAP,
-) -> list[str]:
-    """Split ``text`` into overlapping chunks for embedding.
-
-    Args:
-        text: Full document text.
-        size: Target chunk length in characters.
-        overlap: Characters shared between consecutive chunks.
-
-    Returns:
-        List of non-empty chunks. Empty input yields an empty list.
-    """
-    if not text:
-        return []
-    if size <= 0:
-        raise ValueError("size must be positive")
-    overlap = max(0, min(overlap, size - 1))
-
-    chunks: list[str] = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = min(start + size, text_len)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= text_len:
-            break
-        start = end - overlap
-    return chunks
+    soup = BeautifulSoup(data.decode("utf-8", errors="replace"), "html.parser")
+    return soup.get_text(separator="\n")

@@ -1,106 +1,55 @@
-"""Voice endpoints: TTS synthesis, STT upload stub, capability discovery."""
+"""Voice endpoints: TTS synthesis, STT upload, capability discovery."""
 
 from __future__ import annotations
 
-import logging
-import time
-from typing import Any
+from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi.responses import Response
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from app.core.config import settings
+from app.services import stt, tts
 
-from app.services.stt import stt_service
-from app.services.tts import TtsNotConfiguredError, tts_service
-from app.services.vad import vad_service
-
-logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
 
-class TtsRequest(BaseModel):
-    """Request body for TTS synthesis."""
-
-    text: str = Field(min_length=1, max_length=5_000)
-    voice_id: str | None = Field(default=None, description="ElevenLabs voice override")
-
-
-class SttResponse(BaseModel):
-    """STT upload response (stub until providers are wired)."""
-
-    text: str
-    provider: str | None
-    placeholder: bool
-    duration_ms: int
-    detail: str | None = None
-
-
-class CapabilitiesResponse(BaseModel):
-    """Voice feature availability summary."""
-
-    tts: dict[str, Any]
-    stt: dict[str, Any]
-    vad: dict[str, Any]
-    realtime: dict[str, Any]
+@router.get("/capabilities")
+async def capabilities() -> dict[str, object]:
+    return {
+        "stt": {"available": stt.available(), **stt.capabilities()},
+        "tts": {"available": tts.available(), **tts.capabilities()},
+        "vad": {"available": True},
+        "livekit": {"available": settings.has_livekit, "url": settings.livekit_url or None},
+        "elevenlabs": {"available": settings.has_elevenlabs, "voice_id": settings.elevenlabs_voice_id or None},
+    }
 
 
 @router.post("/tts")
-async def text_to_speech(req: TtsRequest) -> Any:
-    """Synthesize speech (audio/mpeg) via ElevenLabs, or 503 JSON when unconfigured."""
+async def text_to_speech(text: str, voice_id: str | None = None) -> Response:
+    """Synthesize speech -> audio/mpeg (ElevenLabs when configured)."""
     try:
-        result = await tts_service.synthesize(req.text, voice_id=req.voice_id)
-        from fastapi.responses import Response
+        audio = await tts.synthesize(text, voice_id=voice_id)
+    except tts.TTSNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TTS provider error: {exc}") from exc
+    return Response(content=audio, media_type="audio/mpeg")
 
-        return Response(
-            content=result["audio"],
-            media_type="audio/mpeg",
-            headers={"X-TTS-Provider": "elevenlabs", "X-Voice-Id": result["voice_id"]},
-        )
-    except TtsNotConfiguredError as exc:
+
+@router.post("/stt")
+async def speech_to_text(file: UploadFile, language: str | None = None) -> dict[str, object]:
+    """Transcribe an uploaded audio file."""
+    if not stt.available():
         raise HTTPException(
             status_code=503,
-            detail={
-                "error": "tts_not_configured",
-                "provider": "elevenlabs",
-                "message": str(exc),
-            },
-        ) from exc
-
-
-@router.post("/stt", response_model=SttResponse)
-async def speech_to_text(audio: UploadFile = File(...)) -> SttResponse:
-    """Transcribe an uploaded audio file (stub: returns placeholder transcript).
-
-    TODO: route bytes through services.stt once Whisper/Scribe is implemented;
-    currently returns a clearly-marked placeholder so clients can integrate.
-    """
-    started = time.monotonic()
-    data = await audio.read()
-    result = await stt_service.transcribe(data, mime_type=audio.content_type or "audio/wav")
-    duration_ms = int((time.monotonic() - started) * 1000)
-    return SttResponse(
-        text=result.get("text", ""),
-        provider=result.get("provider"),
-        placeholder=bool(result.get("placeholder", True)),
-        duration_ms=duration_ms,
-        detail=result.get("detail"),
-    )
-
-
-@router.get("/capabilities", response_model=CapabilitiesResponse)
-async def capabilities() -> CapabilitiesResponse:
-    """Which voice features are available in this deployment."""
-    return CapabilitiesResponse(
-        tts={
-            "configured": tts_service.is_configured,
-            "providers": tts_service.available_providers(),
-        },
-        stt={
-            "configured": stt_service.is_configured,
-            "providers": stt_service.available_providers(),
-        },
-        vad=vad_service.info(),
-        realtime={
-            "websocket": "/ws/voice",
-            "livekit": "not-integrated",
-        },
-    )
+            detail="No STT provider configured (set ELEVENLABS_API_KEY or OPENAI_API_KEY).",
+        )
+    audio = await file.read()
+    try:
+        result = await stt.transcribe(audio, filename=file.filename or "audio.webm", language=language)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"STT provider error: {exc}") from exc
+    return {
+        "text": result.text,
+        "provider": result.provider,
+        "language": result.language,
+        "duration_seconds": result.duration_seconds,
+    }

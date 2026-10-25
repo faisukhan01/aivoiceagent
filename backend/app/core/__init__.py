@@ -1,1 +1,1 @@
-"""Core package: configuration, settings, shared helpers."""
+"""Core package: configuration and shared utilities."""

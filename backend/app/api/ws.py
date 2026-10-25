@@ -1,109 +1,78 @@
-"""WebSocket endpoint for the realtime voice loop.
+"""WebSocket endpoints for the real-time voice pipeline.
 
-Protocol (JSON frames, client → server):
-    {"type": "ping"}                          → {"type": "pong"}
-    {"type": "audio", "data": "<b64 pcm16>"}  → VAD + placeholder reply
+Client → server JSON frames:
+  {"type": "ping"}                          → {"type": "pong"}
+  {"type": "audio", "data": "<b64 pcm16>"}  → {"type": "vad", "speech": bool, "speech_frames": n}
+  {"type": "text",  "data": "hello"}        → {"type": "llm", "text": "..."}  (when keys configured)
 
-TODO (pipeline stubs to fill in):
-    1. STT   — feed accumulated speech frames into services.stt.transcribe
-    2. LLM   — pass transcript into services.llm (streaming) with conversation history
-    3. TTS   — synthesize the LLM reply via services.tts and send b64 audio frames back
+This is the wiring point for the full duplex loop:
+  mic → VAD → STT → LLM (stream) → TTS → playback
 """
 
 from __future__ import annotations
 
 import base64
-import binascii
+import json
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.core.config import get_settings
-from app.services import vad as vad_service
-from app.services.stt import stt_service
+from app.services.vad import get_vad
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(tags=["voice-ws"])
 
 
 @router.websocket("/ws/voice")
-async def voice_socket(websocket: WebSocket) -> None:
-    """Realtime voice websocket.
-
-    Handles control frames (ping) and audio frames. Audio frames are base64
-    PCM16 and pass through VAD; the STT→LLM→TTS pipeline is stubbed with
-    clear extension points.
-    """
-    settings = get_settings()
-    await websocket.accept()
-    logger.info("Voice websocket connected from %s", websocket.client)
-    await websocket.send_json(
-        {
-            "type": "hello",
-            "message": "AI Voice Agent websocket ready",
-            "vad_backend": vad_service.vad_service.info()["backend"],
-            "stt_configured": stt_service.is_configured,
-            "llm_providers": "auto",
-        }
-    )
-
+async def voice_socket(ws: WebSocket) -> None:
+    await ws.accept()
+    vad = get_vad()
+    logger.info("voice socket connected (vad=%s)", vad.name)
     try:
         while True:
-            frame = await websocket.receive_json()
-
-            if frame.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
+            raw = await ws.receive_text()
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "detail": "frames must be JSON text"})
                 continue
 
-            if frame.get("type") == "audio":
-                await _handle_audio_frame(websocket, frame)
-                continue
+            msg_type = frame.get("type")
 
-            # Unknown frame type — echo an error, never crash the socket.
-            await websocket.send_json(
-                {"type": "error", "detail": f"unknown frame type {frame.get('type')!r}"}
-            )
+            if msg_type == "ping":
+                await ws.send_json({"type": "pong"})
+
+            elif msg_type == "audio":
+                try:
+                    pcm = base64.b64decode(frame.get("data", ""))
+                except Exception:
+                    await ws.send_json({"type": "error", "detail": "invalid base64 audio"})
+                    continue
+                from app.services.vad import FRAME_BYTES
+
+                speech_frames = vad.frames_with_speech(pcm)
+                await ws.send_json(
+                    {
+                        "type": "vad",
+                        "engine": vad.name,
+                        "speech": bool(speech_frames),
+                        "speech_frames": len(speech_frames),
+                        "total_frames": max(len(pcm) // FRAME_BYTES, 0),
+                    }
+                )
+
+            elif msg_type == "text":
+                # LLM loop: wired to provider abstraction; graceful when unconfigured.
+                try:
+                    from app.services.llm import ChatMessage, chat
+
+                    result = await chat([ChatMessage(role="user", content=str(frame.get("data", "")))])
+                    await ws.send_json({"type": "llm", "provider": result.provider, "text": result.text})
+                except Exception as exc:
+                    await ws.send_json({"type": "llm-unavailable", "detail": str(exc)})
+
+            else:
+                await ws.send_json({"type": "error", "detail": f"unknown frame type: {msg_type}"})
 
     except WebSocketDisconnect:
-        logger.info("Voice websocket disconnected")
-    except Exception:  # noqa: BLE001 — keep server alive on protocol errors
-        logger.exception("Voice websocket error")
-        try:
-            await websocket.send_json({"type": "error", "detail": "internal server error"})
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def _handle_audio_frame(websocket: WebSocket, frame: dict) -> None:
-    """Decode a base64 PCM16 audio frame, run VAD, reply with placeholders."""
-    b64_data = frame.get("data", "")
-    try:
-        audio = base64.b64decode(b64_data, validate=True)
-    except (binascii.Error, ValueError):
-        await websocket.send_json({"type": "error", "detail": "invalid base64 audio data"})
-        return
-
-    is_speech = vad_service.vad_service.is_speech(audio)
-    if not is_speech:
-        await websocket.send_json(
-            {"type": "status", "message": "silence", "bytes": len(audio)}
-        )
-        return
-
-    # ---- Pipeline stub --------------------------------------------------- #
-    # 1. STT:   transcript = await stt_service.transcribe(audio)   (TODO)
-    # 2. LLM:   reply = await llm_service.chat(...)                (TODO)
-    # 3. TTS:   audio_out = await tts_service.synthesize(reply)    (TODO)
-    transcript = await stt_service.transcribe(audio)  # placeholder, keeps plumbing real
-    await websocket.send_json(
-        {
-            "type": "transcript.placeholder",
-            "speech_detected": True,
-            "bytes": len(audio),
-            "text": transcript.get("text", ""),
-            "provider": transcript.get("provider"),
-            "detail": transcript.get("detail"),
-            "pipeline": {"stt": "stub", "llm": "stub", "tts": "stub"},
-        }
-    )
+        logger.info("voice socket disconnected")

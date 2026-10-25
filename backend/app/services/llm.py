@@ -1,375 +1,214 @@
-"""LLM provider abstraction.
+"""LLM provider abstraction: OpenAI / Anthropic / Google Gemini.
 
-Chooses a provider automatically based on which API keys are configured
-(preference order: OpenAI → Anthropic → Google), or honors an explicit
-``provider`` override. Supports non-streaming and streaming chat, and is
-tool-calling-ready via a ``tools`` passthrough parameter.
-
-Every provider SDK is imported lazily inside the functions that use it so
-the module imports cleanly even when no SDK/key is installed/configured.
+Selected automatically by whichever API keys are configured (explicit override
+supported). Tool calling and streaming are wired through and ready to use.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-from collections.abc import AsyncIterator, Sequence
-from typing import Any, Literal
+import os
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any
 
-from app.core.config import get_settings
-
-logger = logging.getLogger(__name__)
-
-ProviderName = Literal["openai", "anthropic", "google"]
-
-# Default model identifiers per provider (override per-call if desired).
-DEFAULT_MODELS: dict[str, str] = {
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-3-5-haiku-latest",
-    "google": "gemini-2.0-flash",
-}
-
-Message = dict[str, Any]
+from app.core.config import settings
 
 
 class AiNotConfiguredError(RuntimeError):
-    """Raised when no LLM provider key is available for the request."""
+    """Raised when no LLM provider API key is configured."""
 
 
-def _resolve_provider(provider: str | None) -> ProviderName:
-    """Pick a provider explicitly, or auto-detect from configured keys."""
-    settings = get_settings()
-    if provider:
-        provider = provider.lower().strip()
-        if provider not in DEFAULT_MODELS:
-            raise ValueError(
-                f"Unknown provider {provider!r}; expected one of {sorted(DEFAULT_MODELS)}"
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+
+
+@dataclass
+class LLMResult:
+    text: str
+    provider: str
+    model: str
+    raw: Any = field(default=None, repr=False)
+
+
+def available_providers() -> dict[str, bool]:
+    return {
+        "openai": settings.has_openai,
+        "anthropic": settings.has_anthropic,
+        "google": settings.has_google,
+    }
+
+
+def resolve_provider(preferred: str | None = None) -> str:
+    """Pick a provider: explicit override first, then any configured key."""
+    if preferred:
+        if preferred not in ("openai", "anthropic", "google"):
+            raise ValueError(f"Unknown provider: {preferred}")
+        if not available_providers()[preferred]:
+            raise AiNotConfiguredError(
+                f"Provider '{preferred}' requested but its API key is not configured."
             )
-        return provider  # type: ignore[return-value]
-    if settings.has_openai:
-        return "openai"
-    if settings.has_anthropic:
-        return "anthropic"
-    if settings.has_google:
-        return "google"
+        return preferred
+    for name, ok in available_providers().items():
+        if ok:
+            return name
     raise AiNotConfiguredError(
-        "No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY "
-        "or GOOGLE_API_KEY in the backend .env file."
+        "No LLM provider configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY."
     )
 
 
-class LlmService:
-    """Thin async facade over OpenAI / Anthropic / Google GenAI SDKs."""
+DEFAULT_MODELS = {
+    "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+    "google": os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"),
+}
 
-    name = "llm"
 
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+async def chat(
+    messages: list[ChatMessage],
+    provider: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    system: str | None = None,
+) -> LLMResult:
+    """One-shot chat completion with tool-calling passthrough."""
+    name = resolve_provider(provider)
+    if name == "openai":
+        return await _chat_openai(messages, tools, system)
+    if name == "anthropic":
+        return await _chat_anthropic(messages, tools, system)
+    return await _chat_google(messages, tools, system)
 
-    async def chat(
-        self,
-        messages: Sequence[Message],
-        *,
-        provider: str | None = None,
-        model: str | None = None,
-        system: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 1024,
-        tools: Sequence[dict[str, Any]] | None = None,
-    ) -> Message:
-        """Non-streaming chat completion. Returns the assistant message dict.
 
-        Args:
-            messages: OpenAI-style ``{"role", "content"}`` messages.
-            provider: Explicit provider override ("openai"|"anthropic"|"google").
-            model: Model override; defaults per provider.
-            system: Optional system prompt (applied uniformly across providers).
-            temperature: Sampling temperature.
-            max_tokens: Max tokens to generate.
-            tools: Tool/function schemas passed through to the provider
-                (tool-calling-ready; response may include tool_calls).
-        """
-        resolved = _resolve_provider(provider)
-        model = model or DEFAULT_MODELS[resolved]
-        logger.info("LLM chat: provider=%s model=%s msgs=%d", resolved, model, len(messages))
-        if resolved == "openai":
-            return await self._chat_openai(
-                messages, model, system, temperature, max_tokens, tools
-            )
-        if resolved == "anthropic":
-            return await self._chat_anthropic(
-                messages, model, system, temperature, max_tokens, tools
-            )
-        return await self._chat_google(
-            messages, model, system, temperature, max_tokens
-        )
+async def stream_chat(
+    messages: list[ChatMessage],
+    provider: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    system: str | None = None,
+) -> AsyncIterator[str]:
+    """Yield text deltas as they arrive (SSE-friendly)."""
+    name = resolve_provider(provider)
+    if name == "openai":
+        async for delta in _stream_openai(messages, tools, system):
+            yield delta
+    elif name == "anthropic":
+        async for delta in _stream_anthropic(messages, tools, system):
+            yield delta
+    else:
+        async for delta in _stream_google(messages, tools, system):
+            yield delta
 
-    async def stream_chat(
-        self,
-        messages: Sequence[Message],
-        *,
-        provider: str | None = None,
-        model: str | None = None,
-        system: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 1024,
-        tools: Sequence[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[str]:
-        """Streaming chat completion — yields text deltas as they arrive."""
-        resolved = _resolve_provider(provider)
-        model = model or DEFAULT_MODELS[resolved]
-        logger.info("LLM stream: provider=%s model=%s msgs=%d", resolved, model, len(messages))
-        if resolved == "openai":
-            async for delta in self._stream_openai(
-                messages, model, system, temperature, max_tokens, tools
-            ):
-                yield delta
-        elif resolved == "anthropic":
-            async for delta in self._stream_anthropic(
-                messages, model, system, temperature, max_tokens
-            ):
-                yield delta
-        else:
-            async for delta in self._stream_google(
-                messages, model, system, temperature, max_tokens
-            ):
-                yield delta
 
-    def available_providers(self) -> list[str]:
-        """Providers with configured API keys, in preference order."""
-        settings = get_settings()
-        out: list[str] = []
-        if settings.has_openai:
-            out.append("openai")
-        if settings.has_anthropic:
-            out.append("anthropic")
-        if settings.has_google:
-            out.append("google")
-        return out
+# ---------------------------------------------------------------- OpenAI ----
+async def _chat_openai(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> LLMResult:
+    from openai import AsyncOpenAI  # lazy import
 
-    # ------------------------------------------------------------------ #
-    # OpenAI
-    # ------------------------------------------------------------------ #
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    msgs = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.role, "content": m.content} for m in messages
+    ]
+    kwargs: dict[str, Any] = {"model": DEFAULT_MODELS["openai"], "messages": msgs}
+    if tools:
+        kwargs["tools"] = tools
+    resp = await client.chat.completions.create(**kwargs)
+    return LLMResult(
+        text=resp.choices[0].message.content or "",
+        provider="openai",
+        model=resp.model,
+        raw=resp,
+    )
 
-    async def _chat_openai(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-        tools: Sequence[dict[str, Any]] | None,
-    ) -> Message:
-        from openai import AsyncOpenAI  # lazy import
 
-        client = AsyncOpenAI()
-        msgs: list[Message] = []
-        if system:
-            msgs.append({"role": "system", "content": system})
-        msgs.extend(messages)
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": msgs,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = list(tools)
-        resp = await client.chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        return {
-            "role": "assistant",
-            "content": choice.message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in (choice.message.tool_calls or [])
-            ]
-            or None,
-            "model": resp.model,
-        }
+async def _stream_openai(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+    from openai import AsyncOpenAI
 
-    async def _stream_openai(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-        tools: Sequence[dict[str, Any]] | None,
-    ) -> AsyncIterator[str]:
-        from openai import AsyncOpenAI  # lazy import
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    msgs = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.role, "content": m.content} for m in messages
+    ]
+    kwargs: dict[str, Any] = {"model": DEFAULT_MODELS["openai"], "messages": msgs, "stream": True}
+    if tools:
+        kwargs["tools"] = tools
+    stream = await client.chat.completions.create(**kwargs)
+    async for event in stream:
+        delta = event.choices[0].delta.content
+        if delta:
+            yield delta
 
-        client = AsyncOpenAI()
-        msgs: list[Message] = []
-        if system:
-            msgs.append({"role": "system", "content": system})
-        msgs.extend(messages)
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": msgs,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if tools:
-            kwargs["tools"] = list(tools)
-        stream = await client.chat.completions.create(**kwargs)
-        async for event in stream:
-            if event.choices and event.choices[0].delta.content:
-                yield event.choices[0].delta.content
 
-    # ------------------------------------------------------------------ #
-    # Anthropic
-    # ------------------------------------------------------------------ #
+# ------------------------------------------------------------- Anthropic ----
+async def _chat_anthropic(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> LLMResult:
+    import anthropic  # lazy import
 
-    @staticmethod
-    def _anthropic_messages(messages: Sequence[Message]) -> list[Message]:
-        """Map OpenAI-style roles to Anthropic's user/assistant-only format."""
-        return [
-            {
-                "role": m["role"] if m["role"] != "assistant" else "assistant",
-                "content": m.get("content", ""),
-            }
-            for m in messages
-            if m.get("role") in ("user", "assistant")
-        ]
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    kwargs: dict[str, Any] = {
+        "model": DEFAULT_MODELS["anthropic"],
+        "max_tokens": 1024,
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+    }
+    if system:
+        kwargs["system"] = system
+    if tools:
+        kwargs["tools"] = tools
+    resp = await client.messages.create(**kwargs)
+    text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
+    return LLMResult(text=text, provider="anthropic", model=resp.model, raw=resp)
 
-    async def _chat_anthropic(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-        tools: Sequence[dict[str, Any]] | None,
-    ) -> Message:
-        import anthropic  # lazy import
 
-        client = anthropic.AsyncAnthropic()
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._anthropic_messages(messages),
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if system:
-            kwargs["system"] = system
-        if tools:
-            kwargs["tools"] = list(tools)
-        resp = await client.messages.create(**kwargs)
-        text = "".join(
-            block.text for block in resp.content if getattr(block, "type", "") == "text"
-        )
-        return {
-            "role": "assistant",
-            "content": text,
-            "stop_reason": resp.stop_reason,
-            "model": resp.model,
-        }
+async def _stream_anthropic(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+    import anthropic
 
-    async def _stream_anthropic(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-    ) -> AsyncIterator[str]:
-        import anthropic  # lazy import
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    kwargs: dict[str, Any] = {
+        "model": DEFAULT_MODELS["anthropic"],
+        "max_tokens": 1024,
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+        "stream": True,
+    }
+    if system:
+        kwargs["system"] = system
+    if tools:
+        kwargs["tools"] = tools
+    async with client.messages.stream(**kwargs) as stream:
+        async for text in stream.text_stream:
+            yield text
 
-        client = anthropic.AsyncAnthropic()
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._anthropic_messages(messages),
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if system:
-            kwargs["system"] = system
-        async with client.messages.stream(**kwargs) as stream:
-            async for text in stream.text_stream:
-                yield text
 
-    # ------------------------------------------------------------------ #
-    # Google GenAI
-    # ------------------------------------------------------------------ #
+# ----------------------------------------------------------------- Google ----
+async def _chat_google(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> LLMResult:
+    from google import genai  # lazy import
+    from google.genai import types
 
-    async def _chat_google(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-    ) -> Message:
-        from google import genai  # lazy import
-        from google.genai import types  # lazy import
+    client = genai.Client(api_key=settings.google_api_key)
+    contents = [
+        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)])
+        for m in messages
+    ]
+    config = types.GenerateContentConfig(system_instruction=system, tools=tools or None)
+    resp = await client.aio.models.generate_content(
+        model=DEFAULT_MODELS["google"], contents=contents, config=config
+    )
+    return LLMResult(text=resp.text or "", provider="google", model=DEFAULT_MODELS["google"], raw=resp)
 
-        client = genai.Client()
-        config = types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
-        contents = [
-            types.Content(
-                role="model" if m.get("role") == "assistant" else "user",
-                parts=[types.Part(text=str(m.get("content", "")))],
-            )
-            for m in messages
-        ]
-        resp = await client.aio.models.generate_content(
-            model=model, contents=contents, config=config
-        )
-        return {
-            "role": "assistant",
-            "content": resp.text,
-            "model": model,
-        }
 
-    async def _stream_google(
-        self,
-        messages: Sequence[Message],
-        model: str,
-        system: str | None,
-        temperature: float,
-        max_tokens: int,
-    ) -> AsyncIterator[str]:
-        from google import genai  # lazy import
-        from google.genai import types  # lazy import
+async def _stream_google(messages: list[ChatMessage], tools: list[dict[str, Any]] | None, system: str | None) -> AsyncIterator[str]:
+    from google import genai
+    from google.genai import types
 
-        client = genai.Client()
-        config = types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
-        contents = [
-            types.Content(
-                role="model" if m.get("role") == "assistant" else "user",
-                parts=[types.Part(text=str(m.get("content", "")))],
-            )
-            for m in messages
-        ]
-        async for chunk in client.aio.models.generate_content_stream(
-            model=model, contents=contents, config=config
-        ):
-            if chunk.text:
-                yield chunk.text
+    client = genai.Client(api_key=settings.google_api_key)
+    contents = [
+        types.Content(role="user" if m.role != "assistant" else "model", parts=[types.Part(text=m.content)])
+        for m in messages
+    ]
+    config = types.GenerateContentConfig(system_instruction=system, tools=tools or None)
+    async for chunk in client.aio.models.generate_content_stream(
+        model=DEFAULT_MODELS["google"], contents=contents, config=config
+    ):
+        if chunk.text:
+            yield chunk.text
 
 
 def dumps(obj: Any) -> str:
-    """Compact JSON helper for SSE payloads."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
-llm_service = LlmService()
-"""Module-level singleton used by the API routes."""
+    """JSON helper for SSE frames."""
+    return json.dumps(obj, ensure_ascii=False)

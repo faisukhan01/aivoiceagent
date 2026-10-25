@@ -1,1 +1,1 @@
-"""API package: websocket router and REST routers."""
+"""HTTP API layer."""

@@ -37,6 +37,11 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "angular-app",
+    "backend",
+    "mini-services",
+    "examples",
+    "skills"
   ]
 }
