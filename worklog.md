@@ -37,3 +37,22 @@ Work Log:
 
 Stage Summary:
 - Product delivered and pushed to GitHub. Real streaming chat + citations + voice verified end-to-end. Turso coexistence via namespaced tables. Remaining: Playwright chromium install for repo CI e2e, LiveKit/ElevenLabs/hosted-LLM activation awaits user keys (adapters ready).
+
+---
+Task ID: 9 (hotfix)
+Agent: main orchestrator (Z.ai Code)
+Task: Fix sign-up/sign-in "Registration failed" error + push to GitHub
+
+Work Log:
+- Diagnosed via dev.log: `[register] SQLITE_ERROR: no such table: main.conversations` — migrate() crashed on every call, breaking ALL DB operations.
+- Root cause 1: src/lib/db/client.ts SCHEMA had copy-paste bug — 3 CREATE INDEX statements targeted `conversations`/`messages`/`documents` instead of namespaced `auralis_*` tables.
+- Root cause 2: .env had lost Turso credentials (fell back to local file DB where those foreign table names don't exist) and had no NEXTAUTH_SECRET.
+- Fixed index statements to target auralis_conversations/auralis_messages/auralis_documents.
+- Restored TURSO_DATABASE_URL/TURSO_AUTH_TOKEN; generated NEXTAUTH_SECRET (local only, never committed).
+- Cloud cleanup: earlier partial migration had created the 3 misplaced indexes ON THE USER'S OWN project tables (conversations/messages/documents = their clinic app). Dropped them (their schema restored to pristine) and created correct indexes on auralis_* tables.
+- Verified E2E via agent-browser: register (201) → auto sign-in → workspace renders; sign-out → sign-in → workspace renders; zero page errors.
+- Cleaned all test accounts from Turso (auralis_users = 0) so the user can register admin@cd.com fresh with their own password.
+- Security: discovered .env / .zscripts/dev.pid / db/custom.db were git-TRACKED (ignore rules added after initial commit). Untracked via git rm --cached — secrets can never be pushed.
+
+Stage Summary:
+- Registration + sign-in fully working against Turso cloud; user's own project tables untouched; zero secrets in git history from this point. Hotfix pushed to main.

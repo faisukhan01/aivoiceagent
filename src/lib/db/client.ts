@@ -38,7 +38,7 @@ const SCHEMA = [
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_auralis_conversations_user ON conversations(user_id, updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_auralis_conversations_user ON auralis_conversations(user_id, updated_at DESC)`,
   `CREATE TABLE IF NOT EXISTS auralis_messages (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES auralis_conversations(id) ON DELETE CASCADE,
@@ -48,7 +48,7 @@ const SCHEMA = [
     meta TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_auralis_messages_conversation ON messages(conversation_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_auralis_messages_conversation ON auralis_messages(conversation_id, created_at)`,
   `CREATE TABLE IF NOT EXISTS auralis_settings (
     user_id TEXT PRIMARY KEY REFERENCES auralis_users(id) ON DELETE CASCADE,
     default_model TEXT NOT NULL DEFAULT 'auralis-core',
@@ -68,7 +68,7 @@ const SCHEMA = [
     content TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_auralis_documents_user ON documents(user_id, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_auralis_documents_user ON auralis_documents(user_id, created_at DESC)`,
 ]
 
 /** Idempotent schema migration — safe to call on every cold start. */

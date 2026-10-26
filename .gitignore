@@ -28,7 +28,8 @@ __pycache__/
 *.log
 backend/uvicorn.log
 backend/local.db
-db/custom.db
+db/*.db
+db/*.db-journal
 tool-results/
 
 # testing
