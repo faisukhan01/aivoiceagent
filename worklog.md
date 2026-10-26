@@ -77,3 +77,20 @@ Work Log:
 
 Stage Summary:
 - Voice pipeline structurally fixed: every utterance is now a complete valid WebM; mic can never get stuck disarmed; time-to-first-audio roughly halved. User's own account (admin@cd.com, registered after the auth fix) preserved in Turso.
+
+---
+Task ID: 11 (hotfix)
+Agent: main orchestrator (Z.ai Code)
+Task: Voice still silent on follow-up turns + slow turn-taking
+
+Work Log:
+- Found the decisive bug: pendingSpokenLen (TTS spoken-prefix cursor) was never reset between turns. Turn 2+ responses shorter than turn 1's enqueued NOTHING → assistant went fully silent while the transcript still updated ("not responding completely"). Short punctuation-less answers ("Sure") were also never spoken (flush relied on a sentence-boundary match).
+- Fixed: cursor reset at turn start; tail flush now sends full.slice(cursor) regardless of punctuation.
+- Fixed VAD feedback loop: noise floor previously adapted on any sub-threshold audio — quiet mics let the user's own speech raise the floor, raising the threshold, making the mic progressively harder to trigger ("takes forever to listen"). Floor now adapts only on genuinely quiet ambience (<0.02 absolute).
+- Restored barge-in (regression from task 10): mic is now armed during thinking AND speaking via armBarge() — echo-guarded (2x threshold multiplier + 250ms sustained confirmation), chunks reset at barge capture start to avoid recording TTS echo into the user's utterance.
+- Snappier turn-taking: silence tail 650→550ms; TTS now cuts at commas (softMinLen 36) instead of waiting for full sentences — first audio ~1s earlier.
+- Measured: chat first token 0.95s warm / 1.77s cold; ASR ~450ms; full warm chain speech-end → first audio ≈3.3s (was 5-6s+).
+- Splitter logic verified against 4 scenarios (long/shorter-follow-up/punctuation-less/comma-cut) — all now produce audio.
+
+Stage Summary:
+- Follow-up turns speak reliably; mic trigger no longer degrades; interruption by talking over the assistant works; turn latency materially reduced.

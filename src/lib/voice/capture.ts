@@ -44,6 +44,7 @@ export class VoiceCapture {
   private chunks: Blob[] = []
   private raf = 0
   private state: CaptureState = 'idle'
+  private barge = false
   private silenceSince = 0
   private speechStartedAt = 0
   private noiseFloor = 0.012
@@ -73,12 +74,32 @@ export class VoiceCapture {
   /** Begin listening for the next utterance. Safe to call repeatedly. */
   arm(): void {
     if (this.state === 'capturing') return
+    this.barge = false
     this.chunks = []
     this.silenceSince = 0
     this.state = 'armed'
+    this.ensureRecorder()
+  }
+
+  /**
+   * Arm the mic while the assistant is thinking/speaking (barge-in mode).
+   * Uses an echo-guarded threshold: the trigger needs to be louder AND
+   * sustained longer than normal speech, so the assistant's own TTS output
+   * (attenuated by echo cancellation but still present) doesn't interrupt
+   * itself, while a real human voice does.
+   */
+  armBarge(): void {
+    if (this.state === 'capturing') return
+    this.chunks = []
+    this.silenceSince = 0
+    this.state = 'armed'
+    this.barge = true
+    this.ensureRecorder()
+  }
+
+  private ensureRecorder(): void {
     // A fresh recorder per utterance guarantees a valid WebM header.
     if (!this.recorder || this.recorder.state === 'inactive') this.spawnRecorder()
-    if (this.recorder && this.recorder.state === 'paused') this.recorder.resume()
     if (this.recorder && this.recorder.state !== 'recording') {
       try {
         this.recorder.start(250)
@@ -131,9 +152,9 @@ export class VoiceCapture {
 
   /** Adaptive speech threshold from the running noise floor. */
   private threshold(): number {
-    const min = this.opts.minThreshold ?? 0.018
-    const max = this.opts.maxThreshold ?? 0.22
-    const mult = this.opts.sensitivity ?? 2.8
+    const min = this.opts.minThreshold ?? 0.015
+    const max = this.barge ? 0.3 : 0.18
+    const mult = this.barge ? (this.opts.sensitivity ?? 2.5) * 2.0 : (this.opts.sensitivity ?? 2.5)
     return Math.min(max, Math.max(min, this.noiseFloor * mult))
   }
 
@@ -150,15 +171,18 @@ export class VoiceCapture {
     this.opts.onLevel?.(rms)
 
     const now = performance.now()
-    const silenceMs = this.opts.silenceMs ?? 650
-    const minSpeechMs = this.opts.minSpeechMs ?? 120
+    const silenceMs = this.opts.silenceMs ?? 550
+    const minSpeechMs = this.barge ? 250 : (this.opts.minSpeechMs ?? 120)
     const maxUtteranceMs = this.opts.maxUtteranceMs ?? 25_000
     const startTh = this.threshold()
     const endTh = startTh * 0.65
 
-    if (this.state === 'armed' || this.state === 'capturing') {
-      // Track the noise floor only while the user is quiet.
-      if (rms < startTh) this.noiseFloor = 0.92 * this.noiseFloor + 0.08 * rms
+    // Adapt the noise floor ONLY on genuinely quiet ambience (absolute cap).
+    // Adapting on any sub-threshold audio let the user's own quiet speech
+    // raise the floor, which raised the threshold, which made the mic harder
+    // to trigger — the "takes forever to start listening" feedback loop.
+    if ((this.state === 'armed' || this.state === 'pending') && !this.barge && rms < 0.02) {
+      this.noiseFloor = 0.92 * this.noiseFloor + 0.08 * rms
     }
 
     if (this.state === 'armed' && rms > startTh) {
@@ -170,6 +194,7 @@ export class VoiceCapture {
       if (rms > startTh) {
         if (now - this.speechStartedAt >= minSpeechMs) {
           this.state = 'capturing'
+          if (this.barge) this.chunks = [] // drop echo pre-roll from the TTS playback
           this.opts.onSpeechStart?.()
         }
       } else {

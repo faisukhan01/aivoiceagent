@@ -65,11 +65,18 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
     async (text: string) => {
       if (!text.trim()) return
       busyRef.current = true
+      // CRITICAL: reset the spoken-prefix cursor per turn — otherwise a
+      // response shorter than the previous one enqueues nothing and the
+      // assistant goes silent (the "not responding completely" bug).
+      pendingSpokenLen.current = 0
       setTurns((t) => [...t, { role: 'user', text }])
       transcriptRef.current = ''
       setPartialUser('')
       setPartialAssistant('')
       setCallState('thinking')
+      // Barge-in window: mic is live (echo-guarded) during thinking, so the
+      // user can interrupt a slow/wrong answer by just talking over it.
+      captureRef.current?.armBarge()
 
       const controller = new AbortController()
       streamRef.current = controller
@@ -114,10 +121,12 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
             }
           }
 
-          // Sentence-chunked TTS: enqueue complete sentences as they stream.
+          // Chunked TTS: enqueue at sentence boundaries, or soft breaks
+          // (commas) once enough text is on screen — first audio starts
+          // ~1s earlier than waiting for a full sentence.
           const queue = queueRef.current
           if (queue) {
-            const spoken = queuePendingSpoken(full)
+            const spoken = queuePendingSpoken(full, 36)
             if (spoken.length > pendingSpokenLen.current) {
               const newText = spoken.slice(pendingSpokenLen.current)
               pendingSpokenLen.current = spoken.length
@@ -126,12 +135,13 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
           }
         }
 
-        // Flush any trailing sentence.
+        // Flush the tail: everything not yet spoken, even without a
+        // trailing punctuation (previously a bare "Sure" was never spoken).
         const queue = queueRef.current
-        const spoken = queuePendingSpoken(full)
-        if (queue && spoken.slice(pendingSpokenLen.current).trim()) {
-          queue.enqueue(spoken.slice(pendingSpokenLen.current).trim())
-          pendingSpokenLen.current = spoken.length
+        if (queue && full.length > pendingSpokenLen.current) {
+          const tail = full.slice(pendingSpokenLen.current).trim()
+          if (tail) queue.enqueue(tail)
+          pendingSpokenLen.current = full.length
         }
 
         setTurns((t) => [...t, { role: 'assistant', text: full }])
@@ -154,10 +164,19 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
 
   const pendingSpokenLen = useRef(0)
 
-  /** Sentence boundary splitter used to stream TTS while tokens arrive. */
-  function queuePendingSpoken(text: string): string {
-    const match = text.match(/^[\s\S]*[.!?。！?]\s/)
-    return match ? match[0] : ''
+  /**
+   * Splitter for streaming TTS: returns the speakable prefix of `text`.
+   * Prefers sentence ends; falls back to soft breaks (comma/colon/dash)
+   * once at least `softMinLen` chars are buffered so playback starts early.
+   */
+  function queuePendingSpoken(text: string, softMinLen = 0): string {
+    const sentence = text.match(/^[\s\S]*[.!?。！?]\s/)
+    if (sentence && sentence[0].length >= softMinLen) return sentence[0]
+    if (text.length >= softMinLen) {
+      const soft = text.match(/^[\s\S]*[，,;；:—]\s/)
+      if (soft) return soft[0]
+    }
+    return ''
   }
 
   /** Handle a finished user utterance blob: transcribe, then run the turn. */
@@ -206,8 +225,11 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
         queueBusyRef.current = s !== 'idle'
         if (s === 'idle') {
           maybeRearm()
-        } else if (busyRef.current || stateRef.current === 'speaking') {
-          setCallState('speaking')
+        } else {
+          // Synthesizing or speaking — keep the mic live with the echo
+          // guard so the user can interrupt ("just talk over me").
+          captureRef.current?.armBarge()
+          if (busyRef.current || stateRef.current === 'speaking') setCallState('speaking')
         }
       },
     })
