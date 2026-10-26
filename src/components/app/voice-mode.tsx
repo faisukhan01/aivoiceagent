@@ -20,6 +20,10 @@ interface Turn {
  * Live voice conversation.
  * Real end-to-end pipeline: mic → VAD → ASR → streaming LLM → chunked TTS →
  * playback, with barge-in interruption while the assistant speaks.
+ *
+ * Re-arm invariant: the mic is re-armed exactly when BOTH the chat stream and
+ * the TTS queue are done (whichever finishes last triggers the re-arm), so the
+ * microphone can never get stuck disarmed between turns.
  */
 export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
   const { setVoiceMode, voice } = useStore()
@@ -32,21 +36,35 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
 
   const captureRef = useRef<VoiceCapture | null>(null)
   const queueRef = useRef<SpeechQueue | null>(null)
-  const busyRef = useRef(false)
+  const busyRef = useRef(false) // chat stream in flight
+  const queueBusyRef = useRef(false) // TTS synthesis/playback in flight
   const streamRef = useRef<AbortController | null>(null)
+  const errorTimerRef = useRef<number | null>(null)
   const transcriptRef = useRef('')
-  const lastUserRef = useRef('')
 
   const setCallState = useCallback((s: CallState) => {
     setState(s)
   }, [])
+
+  const showError = useCallback((message: string) => {
+    setError(message)
+    if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current)
+    errorTimerRef.current = window.setTimeout(() => setError(null), 5000)
+  }, [])
+
+  /** Re-arm the mic iff nothing is in flight — the single re-arm gate. */
+  const maybeRearm = useCallback(() => {
+    if (!busyRef.current && !queueBusyRef.current) {
+      captureRef.current?.arm()
+      if (stateRef.current !== 'error') setCallState('listening')
+    }
+  }, [setCallState])
 
   /** One full conversational turn: transcript → stream → speak. */
   const runTurn = useCallback(
     async (text: string) => {
       if (!text.trim()) return
       busyRef.current = true
-      lastUserRef.current = text
       setTurns((t) => [...t, { role: 'user', text }])
       transcriptRef.current = ''
       setPartialUser('')
@@ -120,15 +138,18 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
         setPartialAssistant('')
       } catch (err) {
         if (!(err instanceof DOMException && err.name === 'AbortError')) {
-          setError(err instanceof Error ? err.message : 'Voice turn failed')
+          showError(err instanceof Error ? err.message : 'Voice turn failed')
           setCallState('error')
         }
       } finally {
         streamRef.current = null
         busyRef.current = false
+        // If TTS already drained, this re-arms; otherwise the queue's idle
+        // callback re-arms when it finishes (whichever is last wins).
+        maybeRearm()
       }
     },
-    [setCallState],
+    [maybeRearm, setCallState, showError],
   )
 
   const pendingSpokenLen = useRef(0)
@@ -143,20 +164,36 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
   const handleUtterance = useCallback(
     async (blob: Blob) => {
       setCallState('thinking')
+      busyRef.current = true // transcription counts as busy — blocks stray re-arms
       try {
         const form = new FormData()
         form.append('audio', blob, 'utterance.webm')
         const res = await fetch('/api/voice/transcribe', { method: 'POST', body: form })
         const data = (await res.json()) as { text?: string; error?: string }
-        if (!res.ok || !data.text) throw new Error(data.error ?? 'transcription failed')
+        if (!res.ok) throw new Error(data.error ?? 'transcription failed')
+        // Empty transcript = background noise — silently keep listening.
+        if (!data.text || !data.text.trim()) {
+          busyRef.current = false
+          setCallState('listening')
+          maybeRearm()
+          return
+        }
         setPartialUser(data.text)
         await runTurn(data.text)
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Speech recognition failed')
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          busyRef.current = false
+          return
+        }
+        showError(err instanceof Error ? err.message : 'Speech recognition failed')
         setCallState('error')
+        // Never leave the mic dead — the user can just speak again.
+        busyRef.current = false
+        queueBusyRef.current = false
+        maybeRearm()
       }
     },
-    [runTurn, setCallState],
+    [maybeRearm, runTurn, showError],
   )
 
   // Init capture + playback on mount.
@@ -166,10 +203,11 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
     const queue = new SpeechQueue({
       voice,
       onStateChange: (s) => {
-        if (busyRef.current && s === 'speaking') setCallState('speaking')
-        if (s === 'idle' && !busyRef.current) {
-          setCallState('listening')
-          captureRef.current?.arm()
+        queueBusyRef.current = s !== 'idle'
+        if (s === 'idle') {
+          maybeRearm()
+        } else if (busyRef.current || stateRef.current === 'speaking') {
+          setCallState('speaking')
         }
       },
     })
@@ -179,14 +217,17 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
       onLevel: (l) => setLevel(l),
       onSpeechStart: () => {
         // Barge-in: user started speaking while the assistant talks.
-        if (queueRef.current && (stateRef.current === 'speaking' || stateRef.current === 'synthesizing' as CallState)) {
-          queueRef.current.interrupt()
+        if (queueBusyRef.current || streamRef.current) {
+          queueRef.current?.interrupt()
+          queueBusyRef.current = false
           streamRef.current?.abort()
+          streamRef.current = null
+          busyRef.current = false
         }
         setCallState('listening')
       },
       onSpeechEnd: (blob) => {
-        if (blob.size < 2000) {
+        if (blob.size < 800) {
           // noise blip — re-arm
           captureRef.current?.arm()
           return
@@ -194,7 +235,7 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
         void handleUtterance(blob)
       },
       onError: (e) => {
-        setError(e.message)
+        showError(e.message)
         setCallState('error')
       },
     })
@@ -220,11 +261,11 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
       capture.stop()
       queue.interrupt()
       streamRef.current?.abort()
+      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current)
     }
-     
   }, [])
 
-  // Track state in a ref for the barge-in callback.
+  // Track state in a ref for the callbacks.
   const stateRef = useRef<CallState>('connecting')
   useEffect(() => {
     stateRef.current = state
@@ -288,7 +329,7 @@ export function VoiceMode({ onSend }: { onSend: (text: string) => void }) {
           {state === 'listening' && 'Listening — speak naturally'}
           {state === 'thinking' && 'Thinking…'}
           {state === 'speaking' && 'Speaking — just interrupt me'}
-          {state === 'error' && 'Something went wrong'}
+          {state === 'error' && 'Something went wrong — speak to try again'}
         </p>
 
         {/* live transcript */}

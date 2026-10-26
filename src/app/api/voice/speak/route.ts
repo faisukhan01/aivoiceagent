@@ -17,6 +17,13 @@ const SpeakSchema = z.object({
 
 const VOICES = new Set(['tongtong', 'chuichui', 'xiaochen', 'jam', 'kazi', 'douji', 'luodo'])
 
+/** Cached SDK instance — saves re-initialization on every request. */
+let zaiPromise: Promise<Awaited<ReturnType<typeof ZAI.create>>> | null = null
+function getZai() {
+  zaiPromise ??= ZAI.create()
+  return zaiPromise
+}
+
 /**
  * POST /api/voice/speak — text → speech audio (audio/wav).
  * Long text is chunked on sentence boundaries; PCM segments are joined under
@@ -33,7 +40,7 @@ export async function POST(req: Request) {
   const safeVoice = VOICES.has(voice) ? voice : 'tongtong'
 
   try {
-    const zai = await ZAI.create()
+    const zai = await getZai()
     const chunks = chunkForTts(text)
     const parts: Buffer[] = []
 

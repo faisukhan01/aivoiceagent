@@ -56,3 +56,24 @@ Work Log:
 
 Stage Summary:
 - Registration + sign-in fully working against Turso cloud; user's own project tables untouched; zero secrets in git history from this point. Hotfix pushed to main.
+
+---
+Task ID: 10 (hotfix)
+Agent: main orchestrator (Z.ai Code)
+Task: Fix voice mode — "Speech recognition unavailable" errors, mic not listening, slow responses
+
+Work Log:
+- Diagnosed via dev.log: ASR returned 400 "unsupported audio format: unknown, only WAV and WebM are supported" — client sent WebM blobs MISSING the EBML header.
+- Root cause 1 (corrupt audio): MediaRecorder ran once from mount; arm() cleared the chunk array so utterances after the first were assembled from header-less WebM clusters → every turn after the first failed ASR. Reproduced empirically: headerless blob → 502 with the exact user-facing error; valid WAV → perfect transcript.
+- Root cause 2 (mic deadlock): if the TTS queue drained before the chat stream finalized, capture.arm() was never called again → microphone disarmed forever ("not listening"). Also error states left the mic dead.
+- Root cause 3 (slowness): 900ms silence tail, sequential per-sentence TTS fetch, ZAI.create() per request, and >0.7s utterances silently discarded.
+- Rewrote src/lib/voice/capture.ts: fresh MediaRecorder per utterance (blob assembled in onstop — complete WebM + unclipped tail), adaptive noise-floor threshold with hysteresis, min-speech confirmation (filters blips), 650ms silence tail, 25s max utterance.
+- Rewrote src/lib/voice/playback.ts: look-ahead TTS pipelining (next sentence synthesizes while current plays), isBusy() accessor, hard interrupt preserved.
+- Rewrote voice-mode.tsx state machine: single maybeRearm() gate (re-arm fires from whichever of stream/queue finishes last), barge-in resets busy flags, errors auto-clear after 5s and re-arm (speak to retry), empty transcripts re-arm silently, transcription phase counts as busy.
+- Hardened /api/voice/transcribe: cached ZAI singleton, one retry on transient failure, sub-1KB noise uploads short-circuit to empty text.
+- /api/voice/speak: cached ZAI singleton.
+- Verified: TTS→ASR round-trip with real speech WAV = perfect transcript ×2 runs at ~450ms (was 800ms-2.6s); browser E2E with fake mic: voice overlay opens, VAD armed "Listening", zero console/page errors, server log clean; tsc strict + eslint clean.
+- Ops note: dev server died mid-session — OOM killer took next-server at 2.4GB RSS (Turbopack HMR churn). Restarted via .zscripts/dev.sh; browser closed after tests to free memory.
+
+Stage Summary:
+- Voice pipeline structurally fixed: every utterance is now a complete valid WebM; mic can never get stuck disarmed; time-to-first-audio roughly halved. User's own account (admin@cd.com, registered after the auth fix) preserved in Turso.
